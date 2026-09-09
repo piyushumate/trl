@@ -477,7 +477,7 @@ def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> torch.Tensor | tup
     return flushed_mask, *flushed_tensors
 
 
-def selective_log_softmax(logits, index) -> torch.Tensor:
+def selective_log_softmax(logits: torch.Tensor, index: torch.Tensor, chunk_size: int = 512) -> torch.Tensor:
     """
     A memory-efficient implementation of the common `log_softmax -> gather` operation.
 
@@ -495,6 +495,8 @@ def selective_log_softmax(logits, index) -> torch.Tensor:
         index (`torch.Tensor`):
             Index tensor of shape `(..., K)` or `(...)`, specifying the positions to gather from the log-softmax
             output. When the last case is used, `K` log-probabilities are gathered per position (e.g. for top-K)
+        chunk_size (`int`, *optional*, defaults to `512`):
+            Chunk size along the flattened token dimension to bound peak memory usage during half-precision gathering.
 
     Returns:
         `torch.Tensor`:
@@ -506,17 +508,24 @@ def selective_log_softmax(logits, index) -> torch.Tensor:
 
     if logits.dtype in [torch.float32, torch.float64]:
         selected_logits = torch.gather(logits, dim=-1, index=index)
-        # loop to reduce peak mem consumption
-        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
-        per_token_logps = selected_logits - logsumexp_values.unsqueeze(-1)  # log_softmax(x_i) = x_i - logsumexp(x)
+        logsumexp_values = torch.logsumexp(logits, dim=-1, keepdim=True)
+        per_token_logps = selected_logits - logsumexp_values
     else:
-        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficient approach
-        per_token_logps = []
-        for row_logits, row_labels in zip(logits, index, strict=True):  # loop to reduce peak mem consumption
-            row_logps = F.log_softmax(row_logits, dim=-1)
-            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels)
-            per_token_logps.append(row_per_token_logps)
-        per_token_logps = torch.stack(per_token_logps)
+        # Half-precision dtypes: chunk along flattened tokens to bound peak memory to (chunk_size, num_classes)
+        # while eliminating slow per-row Python loops on 2D and large-batch inputs.
+        orig_shape = index.shape
+        flat_logits = logits.reshape(-1, logits.shape[-1])
+        flat_index = index.reshape(-1, index.shape[-1])
+
+        per_token_logps_chunks = []
+        for c_start in range(0, flat_logits.shape[0], chunk_size):
+            c_end = min(c_start + chunk_size, flat_logits.shape[0])
+            c_logits = flat_logits[c_start:c_end]
+            c_index = flat_index[c_start:c_end]
+            c_logps = F.log_softmax(c_logits, dim=-1)
+            per_token_logps_chunks.append(c_logps.gather(dim=-1, index=c_index))
+
+        per_token_logps = torch.cat(per_token_logps_chunks, dim=0).reshape(orig_shape)
 
     if squeeze:
         per_token_logps = per_token_logps.squeeze(-1)
@@ -554,7 +563,9 @@ def entropy_from_logits(logits: torch.Tensor, chunk_size: int = 128) -> torch.Te
     entropies = []
     for chunk in flat_logits.split(chunk_size, dim=0):
         logps = F.log_softmax(chunk, dim=-1)
-        chunk_entropy = -(torch.exp(logps) * logps).sum(-1)
+        probs = torch.exp(logps)
+        probs.mul_(logps)
+        chunk_entropy = -probs.sum(-1)
         entropies.append(chunk_entropy)
 
     entropies = torch.cat(entropies, dim=0)

@@ -934,6 +934,25 @@ class TestSelectiveLogSoftmax(TrlTestCase):
         else:
             torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-5)
 
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("chunk_size", [1, 17, 128])
+    def test_selective_log_softmax_2d_and_chunk_sizes(self, dtype, chunk_size):
+        """Test selective_log_softmax with 2D flattened tokens and custom chunk sizes"""
+        num_tokens = 64
+        vocab_size = 512
+
+        index = torch.randint(low=0, high=vocab_size, size=(num_tokens,))
+        logits = torch.randn(num_tokens, vocab_size, dtype=dtype)
+
+        expected_output = torch.gather(logits.log_softmax(-1), dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+        actual_output = selective_log_softmax(logits, index, chunk_size=chunk_size)
+
+        assert actual_output.shape == (num_tokens,)
+        if dtype in [torch.float16, torch.bfloat16]:
+            assert torch.equal(actual_output, expected_output)
+        else:
+            torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-5)
+
 
 class TestShuffleSequenceDict(TrlTestCase):
     def test_shuffle_preserves_shape(self):
